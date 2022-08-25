@@ -11,13 +11,11 @@ type TransactionHash = HashMap<u32, Transaction>;
 type ClientHash = HashMap<u16, Client>;
 
 /// Will parse the given `file_name` as a stream input then write the result in `output`
-pub async fn parse_data(file_name: &str, output: &str) -> anyhow::Result<()> {
+pub async fn parse_data(file_name: &str) -> anyhow::Result<()> {
     let mut rdr = csv_async::AsyncReaderBuilder::new()
         .has_headers(true)
         .trim(Trim::All)
         .create_deserializer(File::open(file_name).await?);
-
-    let mut wri = csv_async::AsyncWriter::from_writer(File::create(output).await?);
 
     let mut transactions = rdr.deserialize::<Transaction>();
 
@@ -26,7 +24,7 @@ pub async fn parse_data(file_name: &str, output: &str) -> anyhow::Result<()> {
     let mut past_transactions = HashMap::new();
     let mut disputed_transactions = HashMap::new();
 
-    // 1. Parsing
+    // 1. Parsing input
     while let Some(transaction) = transactions.next().await {
         let mut transaction = transaction?;
         parse_single_transaction(
@@ -37,11 +35,15 @@ pub async fn parse_data(file_name: &str, output: &str) -> anyhow::Result<()> {
         )?;
     }
 
-    // 2. Saving
-    wri.write_record(Client::headers()).await?;
+    // 2. Output
+    let mut wtr = csv_async::AsyncWriter::from_writer(vec![]);
+    wtr.write_record(Client::headers()).await?;
     for (_, client) in clients {
-        wri.write_record(&ByteRecord::from(client)).await?;
+        wtr.write_record(&ByteRecord::from(client)).await?;
     }
+
+    let data = String::from_utf8(wtr.into_inner().await?)?;
+    println!("{}", data);
 
     Ok(())
 }

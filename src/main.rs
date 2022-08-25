@@ -1,28 +1,17 @@
 pub mod entities;
-mod generator;
 mod parser;
 
-use clap::Parser;
-
-#[derive(Parser, Debug)]
-#[clap(author, version)]
-#[clap(about = "CSV transactions parser")]
-struct Args {
-    #[clap(short, long, value_parser)]
-    generate_data: Option<bool>,
-}
+use std::env;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let args = Args::parse();
-
-    // Easy way to generate random data. I'd have used different binaries but exercise just
-    // want to run `cargo run -- filename` for parsing
-    if args.generate_data.is_some() && args.generate_data.unwrap() {
-        generator::generate_data("data.csv");
-        return Ok(());
+    let args = env::args().collect::<Vec<String>>();
+    if args.len() != 2 {
+        panic!("Call with filename input")
     }
+    let file_name: &String = args.last().unwrap();
 
-    parser::parse_data("data.csv", "output.csv").await?;
+    eprintln!("Parsing {}", file_name);
+    parser::parse_data(file_name.as_str()).await?;
     Ok(())
 }
