@@ -28,9 +28,9 @@ pub async fn parse_data(file_name: &str, output: &str) -> anyhow::Result<()> {
 
     // 1. Parsing
     while let Some(transaction) = transactions.next().await {
-        let transaction = transaction?;
+        let mut transaction = transaction?;
         parse_single_transaction(
-            transaction,
+            &mut transaction,
             &mut clients,
             &mut past_transactions,
             &mut disputed_transactions,
@@ -47,7 +47,7 @@ pub async fn parse_data(file_name: &str, output: &str) -> anyhow::Result<()> {
 }
 
 fn parse_single_transaction(
-    transaction: Transaction,
+    transaction: &mut Transaction,
     clients: &mut ClientHash,
     past_transactions: &mut TransactionHash,
     disputed_transactions: &mut TransactionHash,
@@ -66,13 +66,16 @@ fn parse_single_transaction(
         }
     };
 
-    let amount = transaction.amount;
     match transaction.r#type {
         TransactionType::Deposit => {
+            let amount = transaction.amount.expect("no amount");
             client.total += amount;
             client.available += amount;
+            transaction.succeeded = true;
+            past_transactions.insert(transaction.tx, transaction.clone());
         }
         TransactionType::Widthdrawal => {
+            let amount = transaction.amount.expect("no amount");
             if client.available < amount {
                 eprintln!(
                     "Can't widthdraw amount {} for client {}, not enough fund",
@@ -81,64 +84,83 @@ fn parse_single_transaction(
             } else {
                 client.available -= amount;
                 client.total -= amount;
+                transaction.succeeded = true;
+                past_transactions.insert(transaction.tx, transaction.clone());
             }
         }
         TransactionType::Dispute => match past_transactions.get(&transaction.tx) {
             None => {
                 eprintln!(
-                    "Can't dispute amount {} for client {}, non-existing transaction",
-                    amount, client.id
+                    "Can't dispute tx {} for client {}, non-existing transaction",
+                    transaction.tx, client.id
                 );
             }
             Some(past_transaction) => {
-                let amount = past_transaction.amount;
-                if client.available < amount {
-                    eprintln!(
-                        "Can't dispute amount {} for client {}, not enough fund",
-                        amount, client.id
-                    );
+                if past_transaction.r#type == TransactionType::Deposit {
+                    let amount = past_transaction
+                        .amount
+                        .expect("no amount for past transaction");
+
+                    if client.available < amount {
+                        eprintln!(
+                            "Can't dispute amount {} for client {}, not enough fund",
+                            amount, client.id
+                        );
+                    } else {
+                        client.held += amount;
+                        client.available -= amount;
+                        disputed_transactions.insert(past_transaction.tx, past_transaction.clone());
+                        transaction.succeeded = true
+                    }
                 } else {
-                    client.held += amount;
-                    client.available -= amount;
-                    disputed_transactions.insert(past_transaction.tx, past_transaction.clone());
+                    eprintln!(
+                        "Can't dispute tx {} for client {}, isn't a deposit tx",
+                        past_transaction.tx, client.id
+                    );
                 }
             }
         },
         TransactionType::Resolve => match disputed_transactions.get(&transaction.tx) {
             None => {
                 eprintln!(
-                    "Can't resolve amount {} for client {}, non-existing disputed transaction",
-                    amount, client.id
+                    "Can't resolve tx {} for client {}, non-existing disputed transaction",
+                    transaction.tx, client.id
                 );
             }
             Some(disputed_transaction) => {
-                let amount = disputed_transaction.amount;
+                let amount = disputed_transaction
+                    .amount
+                    .expect("no amount for disputed transaction");
 
                 client.held -= amount;
                 client.available += amount;
                 disputed_transactions.remove(&transaction.tx);
+                transaction.succeeded = true
             }
         },
         TransactionType::Chargeback => match disputed_transactions.get(&transaction.tx) {
             None => {
                 eprintln!(
-                    "Can't chargeback amount {} for client {}, non-existing disputed transaction",
-                    amount, client.id
+                    "Can't chargeback tx {} for client {}, non-existing disputed transaction",
+                    transaction.tx, client.id
                 );
             }
             Some(disputed_transaction) => {
-                let amount = disputed_transaction.amount;
+                let amount = disputed_transaction
+                    .amount
+                    .expect("no amount for disputed transaction");
 
                 client.held -= amount;
                 client.total -= amount;
                 client.locked = true;
                 disputed_transactions.remove(&transaction.tx);
+                transaction.succeeded = true
             }
         },
     }
 
     eprintln!("Transaction: {:?}", transaction);
-    past_transactions.insert(transaction.tx, transaction);
+    eprintln!("Client: {:?}", client);
     Ok(())
 }
 
@@ -156,20 +178,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_deposits() -> anyhow::Result<()> {
+    async fn test_deposits_one() -> anyhow::Result<()> {
         let mut test_context = TestContext::default();
-        let transaction = Transaction {
+        let mut transaction = Transaction {
             r#type: TransactionType::Deposit,
             client: 1,
             tx: 1,
-            amount: dec!(2.0),
+            amount: Some(dec!(2.0)),
+            ..Default::default()
         };
         parse_single_transaction(
-            transaction,
+            &mut transaction,
             &mut test_context.clients,
             &mut test_context.past_transactions,
             &mut test_context.disputed_transactions,
         )?;
+        assert!(transaction.succeeded);
 
         assert_that!(test_context.clients[&1].available).is_equal_to(dec!(2.0));
         assert_that!(test_context.clients[&1].held).is_equal_to(dec!(0));
@@ -178,6 +202,527 @@ mod tests {
         assert_that!(test_context.clients).has_length(1);
         assert_that!(test_context.past_transactions).has_length(1);
         assert_that!(test_context.disputed_transactions).has_length(0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_deposits_two() -> anyhow::Result<()> {
+        let mut test_context = TestContext::default();
+        let mut transaction = Transaction {
+            r#type: TransactionType::Deposit,
+            client: 1,
+            tx: 1,
+            amount: Some(dec!(2.0)),
+            ..Default::default()
+        };
+        parse_single_transaction(
+            &mut transaction,
+            &mut test_context.clients,
+            &mut test_context.past_transactions,
+            &mut test_context.disputed_transactions,
+        )?;
+        assert!(transaction.succeeded);
+
+        let mut transaction = Transaction {
+            r#type: TransactionType::Deposit,
+            client: 1,
+            tx: 2,
+            amount: Some(dec!(5.890)),
+            ..Default::default()
+        };
+        parse_single_transaction(
+            &mut transaction,
+            &mut test_context.clients,
+            &mut test_context.past_transactions,
+            &mut test_context.disputed_transactions,
+        )?;
+        assert!(transaction.succeeded);
+
+        assert_that!(test_context.clients[&1].available).is_equal_to(dec!(7.890));
+        assert_that!(test_context.clients[&1].held).is_equal_to(dec!(0));
+        assert_that!(test_context.clients[&1].total).is_equal_to(dec!(7.890));
+        assert_that!(test_context.clients[&1].locked).is_equal_to(false);
+        assert_that!(test_context.clients).has_length(1);
+        assert_that!(test_context.past_transactions).has_length(2);
+        assert_that!(test_context.disputed_transactions).has_length(0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_widthdrawal_enough_fund() -> anyhow::Result<()> {
+        let mut test_context = TestContext::default();
+        let mut transaction = Transaction {
+            r#type: TransactionType::Deposit,
+            client: 1,
+            tx: 1,
+            amount: Some(dec!(20.1234)),
+            ..Default::default()
+        };
+        parse_single_transaction(
+            &mut transaction,
+            &mut test_context.clients,
+            &mut test_context.past_transactions,
+            &mut test_context.disputed_transactions,
+        )?;
+        assert!(transaction.succeeded);
+
+        let mut transaction = Transaction {
+            r#type: TransactionType::Widthdrawal,
+            client: 1,
+            tx: 2,
+            amount: Some(dec!(10.001)),
+            ..Default::default()
+        };
+        parse_single_transaction(
+            &mut transaction,
+            &mut test_context.clients,
+            &mut test_context.past_transactions,
+            &mut test_context.disputed_transactions,
+        )?;
+        assert!(transaction.succeeded);
+
+        assert_that!(test_context.clients[&1].available).is_equal_to(dec!(10.1224));
+        assert_that!(test_context.clients[&1].held).is_equal_to(dec!(0));
+        assert_that!(test_context.clients[&1].total).is_equal_to(dec!(10.1224));
+        assert_that!(test_context.clients[&1].locked).is_equal_to(false);
+        assert_that!(test_context.clients).has_length(1);
+        assert_that!(test_context.past_transactions).has_length(2);
+        assert_that!(test_context.disputed_transactions).has_length(0);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_widthdrawal_not_enough_fund() -> anyhow::Result<()> {
+        let mut test_context = TestContext::default();
+        let mut transaction = Transaction {
+            r#type: TransactionType::Deposit,
+            client: 1,
+            tx: 1,
+            amount: Some(dec!(20.1234)),
+            ..Default::default()
+        };
+        parse_single_transaction(
+            &mut transaction,
+            &mut test_context.clients,
+            &mut test_context.past_transactions,
+            &mut test_context.disputed_transactions,
+        )?;
+        assert!(transaction.succeeded);
+
+        let mut transaction = Transaction {
+            r#type: TransactionType::Widthdrawal,
+            client: 1,
+            tx: 2,
+            amount: Some(dec!(20.12345)),
+            ..Default::default()
+        };
+        parse_single_transaction(
+            &mut transaction,
+            &mut test_context.clients,
+            &mut test_context.past_transactions,
+            &mut test_context.disputed_transactions,
+        )?;
+        assert!(!transaction.succeeded);
+
+        assert_that!(test_context.clients[&1].available).is_equal_to(dec!(20.1234));
+        assert_that!(test_context.clients[&1].held).is_equal_to(dec!(0));
+        assert_that!(test_context.clients[&1].total).is_equal_to(dec!(20.1234));
+        assert_that!(test_context.clients[&1].locked).is_equal_to(false);
+        assert_that!(test_context.clients).has_length(1);
+        assert_that!(test_context.past_transactions).has_length(1);
+        assert_that!(test_context.disputed_transactions).has_length(0);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_dispute_tx_exists() -> anyhow::Result<()> {
+        let mut test_context = TestContext::default();
+        let mut transaction = Transaction {
+            r#type: TransactionType::Deposit,
+            client: 1,
+            tx: 1,
+            amount: Some(dec!(20.1234)),
+            ..Default::default()
+        };
+        parse_single_transaction(
+            &mut transaction,
+            &mut test_context.clients,
+            &mut test_context.past_transactions,
+            &mut test_context.disputed_transactions,
+        )?;
+        assert!(transaction.succeeded);
+
+        let mut transaction = Transaction {
+            r#type: TransactionType::Deposit,
+            client: 1,
+            tx: 2,
+            amount: Some(dec!(1.123)),
+            ..Default::default()
+        };
+        parse_single_transaction(
+            &mut transaction,
+            &mut test_context.clients,
+            &mut test_context.past_transactions,
+            &mut test_context.disputed_transactions,
+        )?;
+        assert!(transaction.succeeded);
+
+        let mut transaction = Transaction {
+            r#type: TransactionType::Dispute,
+            client: 1,
+            tx: 2,
+            ..Default::default()
+        };
+        parse_single_transaction(
+            &mut transaction,
+            &mut test_context.clients,
+            &mut test_context.past_transactions,
+            &mut test_context.disputed_transactions,
+        )?;
+        assert!(transaction.succeeded);
+
+        assert_that!(test_context.clients[&1].available).is_equal_to(dec!(20.1234));
+        assert_that!(test_context.clients[&1].held).is_equal_to(dec!(1.123));
+        assert_that!(test_context.clients[&1].total).is_equal_to(dec!(20.1234) + dec!(1.123));
+        assert_that!(test_context.clients[&1].locked).is_equal_to(false);
+        assert_that!(test_context.clients).has_length(1);
+        assert_that!(test_context.past_transactions).has_length(2);
+        assert_that!(test_context.disputed_transactions).has_length(1);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_dispute_tx_does_not_exist() -> anyhow::Result<()> {
+        let mut test_context = TestContext::default();
+        let mut transaction = Transaction {
+            r#type: TransactionType::Deposit,
+            client: 1,
+            tx: 1,
+            amount: Some(dec!(20.1234)),
+            ..Default::default()
+        };
+        parse_single_transaction(
+            &mut transaction,
+            &mut test_context.clients,
+            &mut test_context.past_transactions,
+            &mut test_context.disputed_transactions,
+        )?;
+        assert!(transaction.succeeded);
+
+        let mut transaction = Transaction {
+            r#type: TransactionType::Deposit,
+            client: 1,
+            tx: 2,
+            amount: Some(dec!(1.123)),
+            ..Default::default()
+        };
+        parse_single_transaction(
+            &mut transaction,
+            &mut test_context.clients,
+            &mut test_context.past_transactions,
+            &mut test_context.disputed_transactions,
+        )?;
+        assert!(transaction.succeeded);
+
+        let mut transaction = Transaction {
+            r#type: TransactionType::Dispute,
+            client: 1,
+            tx: 3,
+            ..Default::default()
+        };
+        parse_single_transaction(
+            &mut transaction,
+            &mut test_context.clients,
+            &mut test_context.past_transactions,
+            &mut test_context.disputed_transactions,
+        )?;
+        assert!(!transaction.succeeded);
+
+        assert_that!(test_context.clients[&1].available).is_equal_to(dec!(20.1234) + dec!(1.123));
+        assert_that!(test_context.clients[&1].held).is_equal_to(dec!(0));
+        assert_that!(test_context.clients[&1].total).is_equal_to(dec!(20.1234) + dec!(1.123));
+        assert_that!(test_context.clients[&1].locked).is_equal_to(false);
+        assert_that!(test_context.clients).has_length(1);
+        assert_that!(test_context.past_transactions).has_length(2);
+        assert_that!(test_context.disputed_transactions).has_length(0);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_resolve_tx_exists() -> anyhow::Result<()> {
+        let mut test_context = TestContext::default();
+        let mut transaction = Transaction {
+            r#type: TransactionType::Deposit,
+            client: 1,
+            tx: 1,
+            amount: Some(dec!(20.1234)),
+            ..Default::default()
+        };
+        parse_single_transaction(
+            &mut transaction,
+            &mut test_context.clients,
+            &mut test_context.past_transactions,
+            &mut test_context.disputed_transactions,
+        )?;
+        assert!(transaction.succeeded);
+
+        let mut transaction = Transaction {
+            r#type: TransactionType::Deposit,
+            client: 1,
+            tx: 2,
+            amount: Some(dec!(1.123)),
+            ..Default::default()
+        };
+        parse_single_transaction(
+            &mut transaction,
+            &mut test_context.clients,
+            &mut test_context.past_transactions,
+            &mut test_context.disputed_transactions,
+        )?;
+        assert!(transaction.succeeded);
+
+        let mut transaction = Transaction {
+            r#type: TransactionType::Dispute,
+            client: 1,
+            tx: 2,
+            ..Default::default()
+        };
+        parse_single_transaction(
+            &mut transaction,
+            &mut test_context.clients,
+            &mut test_context.past_transactions,
+            &mut test_context.disputed_transactions,
+        )?;
+        assert!(transaction.succeeded);
+
+        let mut transaction = Transaction {
+            r#type: TransactionType::Resolve,
+            client: 1,
+            tx: 2,
+            ..Default::default()
+        };
+        parse_single_transaction(
+            &mut transaction,
+            &mut test_context.clients,
+            &mut test_context.past_transactions,
+            &mut test_context.disputed_transactions,
+        )?;
+        assert!(transaction.succeeded);
+
+        assert_that!(test_context.clients[&1].available).is_equal_to(dec!(20.1234) + dec!(1.123));
+        assert_that!(test_context.clients[&1].held).is_equal_to(dec!(0));
+        assert_that!(test_context.clients[&1].total).is_equal_to(dec!(20.1234) + dec!(1.123));
+        assert_that!(test_context.clients[&1].locked).is_equal_to(false);
+        assert_that!(test_context.clients).has_length(1);
+        assert_that!(test_context.past_transactions).has_length(2);
+        assert_that!(test_context.disputed_transactions).has_length(0);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_resolve_tx_does_not_exist() -> anyhow::Result<()> {
+        let mut test_context = TestContext::default();
+        let mut transaction = Transaction {
+            r#type: TransactionType::Deposit,
+            client: 1,
+            tx: 1,
+            amount: Some(dec!(20.1234)),
+            ..Default::default()
+        };
+        parse_single_transaction(
+            &mut transaction,
+            &mut test_context.clients,
+            &mut test_context.past_transactions,
+            &mut test_context.disputed_transactions,
+        )?;
+        assert!(transaction.succeeded);
+
+        let mut transaction = Transaction {
+            r#type: TransactionType::Deposit,
+            client: 1,
+            tx: 2,
+            amount: Some(dec!(1.123)),
+            ..Default::default()
+        };
+        parse_single_transaction(
+            &mut transaction,
+            &mut test_context.clients,
+            &mut test_context.past_transactions,
+            &mut test_context.disputed_transactions,
+        )?;
+        assert!(transaction.succeeded);
+
+        let mut transaction = Transaction {
+            r#type: TransactionType::Dispute,
+            client: 1,
+            tx: 3,
+            ..Default::default()
+        };
+        parse_single_transaction(
+            &mut transaction,
+            &mut test_context.clients,
+            &mut test_context.past_transactions,
+            &mut test_context.disputed_transactions,
+        )?;
+        assert!(!transaction.succeeded);
+
+        let mut transaction = Transaction {
+            r#type: TransactionType::Resolve,
+            client: 1,
+            tx: 3,
+            ..Default::default()
+        };
+        parse_single_transaction(
+            &mut transaction,
+            &mut test_context.clients,
+            &mut test_context.past_transactions,
+            &mut test_context.disputed_transactions,
+        )?;
+        assert!(!transaction.succeeded);
+
+        assert_that!(test_context.clients[&1].available).is_equal_to(dec!(20.1234) + dec!(1.123));
+        assert_that!(test_context.clients[&1].held).is_equal_to(dec!(0));
+        assert_that!(test_context.clients[&1].total).is_equal_to(dec!(20.1234) + dec!(1.123));
+        assert_that!(test_context.clients[&1].locked).is_equal_to(false);
+        assert_that!(test_context.clients).has_length(1);
+        assert_that!(test_context.past_transactions).has_length(2);
+        assert_that!(test_context.disputed_transactions).has_length(0);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_resolve_chargeback_exists() -> anyhow::Result<()> {
+        let mut test_context = TestContext::default();
+        let mut transaction = Transaction {
+            r#type: TransactionType::Deposit,
+            client: 1,
+            tx: 1,
+            amount: Some(dec!(20.1234)),
+            ..Default::default()
+        };
+        parse_single_transaction(
+            &mut transaction,
+            &mut test_context.clients,
+            &mut test_context.past_transactions,
+            &mut test_context.disputed_transactions,
+        )?;
+        assert!(transaction.succeeded);
+
+        let mut transaction = Transaction {
+            r#type: TransactionType::Deposit,
+            client: 1,
+            tx: 2,
+            amount: Some(dec!(1.123)),
+            ..Default::default()
+        };
+        parse_single_transaction(
+            &mut transaction,
+            &mut test_context.clients,
+            &mut test_context.past_transactions,
+            &mut test_context.disputed_transactions,
+        )?;
+        assert!(transaction.succeeded);
+
+        let mut transaction = Transaction {
+            r#type: TransactionType::Dispute,
+            client: 1,
+            tx: 2,
+            ..Default::default()
+        };
+        parse_single_transaction(
+            &mut transaction,
+            &mut test_context.clients,
+            &mut test_context.past_transactions,
+            &mut test_context.disputed_transactions,
+        )?;
+        assert!(transaction.succeeded);
+
+        let mut transaction = Transaction {
+            r#type: TransactionType::Chargeback,
+            client: 1,
+            tx: 2,
+            ..Default::default()
+        };
+        parse_single_transaction(
+            &mut transaction,
+            &mut test_context.clients,
+            &mut test_context.past_transactions,
+            &mut test_context.disputed_transactions,
+        )?;
+        assert!(transaction.succeeded);
+
+        assert_that!(test_context.clients[&1].available).is_equal_to(dec!(20.1234));
+        assert_that!(test_context.clients[&1].held).is_equal_to(dec!(0));
+        assert_that!(test_context.clients[&1].total).is_equal_to(dec!(20.1234));
+        assert!(test_context.clients[&1].locked);
+        assert_that!(test_context.clients).has_length(1);
+        assert_that!(test_context.past_transactions).has_length(2);
+        assert_that!(test_context.disputed_transactions).has_length(0);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_resolve_chargeback_does_not_exist() -> anyhow::Result<()> {
+        let mut test_context = TestContext::default();
+        let mut transaction = Transaction {
+            r#type: TransactionType::Deposit,
+            client: 1,
+            tx: 1,
+            amount: Some(dec!(20.1234)),
+            ..Default::default()
+        };
+        parse_single_transaction(
+            &mut transaction,
+            &mut test_context.clients,
+            &mut test_context.past_transactions,
+            &mut test_context.disputed_transactions,
+        )?;
+        assert!(transaction.succeeded);
+
+        let mut transaction = Transaction {
+            r#type: TransactionType::Deposit,
+            client: 1,
+            tx: 2,
+            amount: Some(dec!(1.123)),
+            ..Default::default()
+        };
+        parse_single_transaction(
+            &mut transaction,
+            &mut test_context.clients,
+            &mut test_context.past_transactions,
+            &mut test_context.disputed_transactions,
+        )?;
+        assert!(transaction.succeeded);
+
+        let mut transaction = Transaction {
+            r#type: TransactionType::Resolve,
+            client: 1,
+            tx: 3,
+            ..Default::default()
+        };
+        parse_single_transaction(
+            &mut transaction,
+            &mut test_context.clients,
+            &mut test_context.past_transactions,
+            &mut test_context.disputed_transactions,
+        )?;
+        assert!(!transaction.succeeded);
+
+        assert_that!(test_context.clients[&1].available).is_equal_to(dec!(20.1234) + dec!(1.123));
+        assert_that!(test_context.clients[&1].held).is_equal_to(dec!(0));
+        assert_that!(test_context.clients[&1].total).is_equal_to(dec!(20.1234) + dec!(1.123));
+        assert!(!test_context.clients[&1].locked);
+        assert_that!(test_context.clients).has_length(1);
+        assert_that!(test_context.past_transactions).has_length(2);
+        assert_that!(test_context.disputed_transactions).has_length(0);
+
         Ok(())
     }
 }

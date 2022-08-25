@@ -3,7 +3,7 @@ use rust_decimal::Decimal;
 use serde::Serialize;
 
 /// Holds details for a given client
-#[derive(Default, Serialize)]
+#[derive(Default, Serialize, Debug)]
 pub struct Client {
     pub id: u16,
     pub available: Decimal,
